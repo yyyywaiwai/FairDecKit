@@ -120,21 +120,23 @@ func readDecryptedBinaries(at url: URL, credential: Data, mode: FairDecKit.Mode)
 
 func writeIPA(from input: URL, to output: URL, credential: Data, mode: FairDecKit.Mode) throws {
     let archive = try Archive(url: input, accessMode: .read)
-    let destination = try Archive(url: output, accessMode: .create)
     let temporary = output.deletingLastPathComponent()
+    let replacements = temporary.appendingPathComponent(UUID().uuidString + ".zip")
+    defer { try? FileManager.default.removeItem(at: replacements) }
     var replaced: Set<String> = []
-    try processBinaries(in: archive, credential: credential, mode: mode, temporary: temporary) { binaryPath, content in
-        guard let entry = archive[binaryPath] else {
-            throw FairDecKitError.invalidData("Missing binary: \(binaryPath)")
-        }
-        try write(destination, entry: entry, content: content)
-        replaced.insert(binaryPath)
-    }
-    for entry in archive where !replaced.contains(entry.path) {
-        try withEntry(archive, entry, mode: mode, temporary: temporary) {
-            try write(destination, entry: entry, content: $0)
+    do {
+        let destination = try Archive(url: replacements, accessMode: .create)
+        try processBinaries(in: archive, credential: credential, mode: mode, temporary: temporary) { binaryPath, content in
+            guard let entry = archive[binaryPath] else {
+                throw FairDecKitError.invalidData("Missing binary: \(binaryPath)")
+            }
+            try write(destination, entry: entry, content: content)
+            replaced.insert(binaryPath)
         }
     }
+    // Validate even unchanged entries before copying their original compressed bytes.
+    for entry in archive where !replaced.contains(entry.path) { try extract(archive, entry) { _ in } }
+    try preserveZIP(from: input, replacing: replacements, to: output)
 }
 
 private func write(_ archive: Archive, entry: Entry, content: EntryContent) throws {
@@ -156,13 +158,9 @@ private func write(_ archive: Archive, entry: Entry, provider: Provider) throws 
     guard let size = Int64(exactly: entry.uncompressedSize) else {
         throw FairDecKitError.invalidData("ZIP entry is too large: \(entry.path)")
     }
-    let attributes = entry.fileAttributes
-    let date = attributes[.modificationDate] as? Date ?? Date(timeIntervalSince1970: 315532800)
-    let permissions = (attributes[.posixPermissions] as? NSNumber)?.uint16Value
     let compression: CompressionMethod = entry.isCompressed ? .deflate : .none
-    // shortcut: ZIP extra fields/comments are regenerated; preserve them if consumers require byte-level ZIP metadata.
     try archive.addEntry(with: entry.path, type: entry.type, uncompressedSize: size,
-                         modificationDate: date, permissions: permissions, compressionMethod: compression,
+                         compressionMethod: compression,
                          bufferSize: zipBufferSize, provider: provider)
 }
 
