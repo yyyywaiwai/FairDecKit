@@ -4,7 +4,7 @@ FairPlay付きIPAと16バイトのcredentialから、復号済みIPAまたはarm
 
 `decrypt.py`、`core.py`、`transform.c`の復号処理をSwiftに移植しています。Python・C実行ファイル・外部プロセス・ネットワーク接続は実行時に使いません。AES-CBCはCommonCrypto、MD5はCryptoKit、ZIP処理は[ZIPFoundation](https://github.com/weichsel/ZIPFoundation) 0.9.20以降を使います。変換テーブルはSPMリソースに含まれます。
 
-credentialの取得は既存の[Pythonスクリプト](/Users/yyyywaiwai/fairplay-decrypt/credential-retrieval/README.md)で行います。
+credentialの取得は[EthanArbuckle/fairplay-decryptのcredential-retrieval](https://github.com/EthanArbuckle/fairplay-decrypt/blob/main/credential-retrieval/README.md)を利用してください。
 
 ## アプリから使う
 
@@ -26,7 +26,11 @@ func decryptIPA(input: URL, output: URL, credentialFile: URL, mode: FairDecKit.M
 
 `input`、`output`にはローカルのファイルURLを渡します。出力先にはハードリンクを使えるファイルシステムが必要です。出力先が既にある場合はエラーになり、入力IPAと既存の出力ファイルは上書きしません。新しい出力先ディレクトリは復号に失敗しても残ることがあります。途中で失敗した場合は一時IPAを削除し、出力先には公開しません。
 
-ZIPはエントリ単位で再構築し、展開後の内容・権限・圧縮方式と、有効なZIP更新日時を引き継ぎます。無効な日付は正規化されます。追加フィールド・コメント・エントリ順は保持しません。APIは同期処理です。アプリでは上の例のようにメインアクターの外で呼び出してください。
+ZIPは元のバイト列をコピーし、復号対象の圧縮データと、それに伴うCRC・圧縮サイズ・参照オフセットだけを書き換えます。
+ローカル／中央ヘッダーの追加フィールド、エントリコメント、ZIP全体のコメント、日時、権限、作成元情報、ファイル名の元のエンコーディング、エントリ順は保持します。
+ZIP64追加フィールドのサイズ・オフセットなど、データ変更に依存する数値だけは更新します。
+未変更エントリは圧縮データやデータディスクリプターも含めてそのままコピーし、再圧縮しません。日時が無効な値でも正規化しません。
+APIは同期処理です。アプリでは上の例のようにメインアクターの外で呼び出してください。
 
 ### 処理モードを選ぶ
 
@@ -73,20 +77,19 @@ func decryptBinary(binary: Data, sinf: Data, supf: Data, credential: Data) throw
 - 448バイト、または末尾8バイトがゼロの440バイトSINF `priv`レコード。
 - credentialはそのIPAに対応した16バイトが必要です。別アカウント等のcredentialはSINF検証エラーになります。
 
-`.lowMemory`のIPA出力では各エントリを非公開の一時ファイルへ64KBずつ展開し、暗号領域を4KBずつ復号してZIPへ戻します。バイナリ全体の入力・出力バッファは保持しません。SINF/SUPFとZIPのメタデータはメモリに保持するため、使用量はこれらのサイズにも依存します。最大エントリ程度の追加一時ディスク領域が必要です。シンボリックリンクの内容は64KBまでです。通常のファイルと異なりZIPFoundationが一括で読むため、この上限を設けています。
+`.lowMemory`のIPA出力では復号対象のバイナリを非公開の一時ファイルへ64KBずつ展開し、暗号領域を4KBずつ復号します。
+バイナリ全体の入力・出力バッファは保持しません。未変更エントリもCRC・サイズ検証を行ってから元の圧縮バイト列をコピーします。
+SINF/SUPFとZIPのメタデータはメモリに保持するため、使用量はこれらのサイズにも依存します。
+両モードとも、復号対象の再圧縮データを一時ZIPに保持します。`.lowMemory`ではさらに最大の復号対象バイナリ程度の一時領域が必要です。
+シンボリックリンクの内容は64KBまでです。通常のファイルと異なりZIPFoundationが一括で読むため、この上限を設けています。
+
+ZIP32の圧縮サイズ・参照オフセットが上限に達する場合は、そのフィールドだけZIP64に昇格します。
+必要に応じてローカルヘッダーのサイズ表現、データディスクリプター、ZIP64終端レコード／ロケーターも更新・追加します。
+追加フィールドの増加とデータディスクリプターの拡張を後続オフセットに反映し、他の追加フィールド・コメントはそのまま保持します。
+既存のZIP64フィールドは値が小さくなってもZIP32へ縮退させません。
+ZIPヘッダーの追加フィールド領域そのものが65,535バイトを超える場合は、既存フィールドを削除せずエラー終了します。
 
 再署名・インストールは行わず、バイナリ変更後のコード署名も再利用できません。復号範囲はPython版と同じです。ページ暗号は認証付き暗号ではないため、暗号化前の原本との一致を証明するAPIではありません。
-
-## モード別の測定例
-
-macOS arm64のReleaseビルドで、同じIPAの復号と全12,946エントリの照合を行った1回ずつの測定です。コンパイラを含めず、XCTestプロセスを`/usr/bin/time -l`で測っています。
-
-| 指標 | `.lowMemory` | `.fast` |
-| --- | ---: | ---: |
-| 最大RSS | 51.5MiB | 437.0MiB |
-| 復号・照合の経過時間 | 14.46秒 | 10.12秒 |
-
-この入力では`.lowMemory`はメモリを抑え、`.fast`は一時ファイルのI/Oを減らして短時間で完了しました。使用量と速度は入力・端末・ストレージに依存します。`decryptBinaries`や`decryptBinary`が返す`Data`の使用量まで固定するものではありません。
 
 ## テスト
 
@@ -96,7 +99,28 @@ macOS arm64のReleaseビルドで、同じIPAの復号と全12,946エントリ�
 swift test
 ```
 
-合成credentialだけを使い、Python/Cから得た既知の変換値、thin／FAT32／FAT64、SINF／SUPFの対応形式、IPA内のレコード選択、破損データ・上書き防止・失敗時の後片付けを確認します。実際のcredentialやIPAはテストリソースに含めません。
+合成credentialだけを使い、Python/Cから得た既知の変換値、thin／FAT32／FAT64、SINF／SUPFの対応形式、IPA内のレコード選択、破損データ・上書き防止・失敗時の後片付けを確認します。ZIP32／ZIP64の追加フィールド・コメント・日時・権限、未変更エントリの圧縮バイト列の保持と、圧縮サイズの増減によるオフセット更新も検証します。実際のcredentialやIPAはテストリソースに含めません。
+
+実ファイルのオフセットが4GiBをまたぐ検証は、次の指定で実行します。入力の大きなゼロ領域はスパースファイルで作成し、ZIP32からZIP64への昇格後にZIPFoundationとシステムの `unzip -t` で内容を検証します。
+
+```sh
+FAIRDECKIT_LARGE_ZIP_TEST=1 swift test --filter ZIP64PromotionTests
+```
+
+4GiB超の暗号化バイナリを生成してインストール済みCLIの両モードを検証する場合は、次を実行します。
+出力ディレクトリは存在しないパスを指定してください。生成IPAと2個の復号IPAで約12GiBを保存し、処理中の一時ファイルにも空き容量が必要です。
+`fast` は大きなメモリを使用するため、通常のテストではこのケースをスキップします。
+
+```sh
+FAIRDECKIT_LARGE_ENCRYPTED_DIR=/Users/yyyywaiwai/ipadecryptcli/runs/large-encrypted-new \
+FAIRDECKIT_IPADECRYPT_BIN=/Users/yyyywaiwai/.local/bin/ipadecrypt \
+swift test -c release --filter LargeEncryptedIPATests/testOver4GiBEncryptedBinaryWithInstalledCLI
+```
+
+バイナリ全体は4,294,975,488バイト、AES-CBCで暗号化した領域は4,294,963,200バイト（1,048,575ページ）です。
+Mach-Oの `cryptsize` は32ビットなので、暗号化領域は最大の4KiB整列値とし、バイナリ全体を4GiB超にしています。
+全バイトのSHA-256、ZIP CRC、`cryptid`、暗号化範囲外の末尾、ZIP64メタデータ、未変更リソースを確認し、`report.json` と各モードの時間・メモリ使用量のログを保存します。
+同じ生成処理を2ページで検証する小さいテストは、通常のテストにも含めています。
 
 実IPAとPython版の出力を照合するテストは、次の4つの環境変数を指定した場合だけ実行します。
 
